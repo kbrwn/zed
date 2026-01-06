@@ -420,6 +420,108 @@ func schemaCompileOuter(cmd *cobra.Command, args []string) (bool, error) {
 	return toStdout, schemaCompileInner(args, outputFile)
 }
 
+// parseImports extracts import statements from a schema file
+func parseImports(schemaContent string) []string {
+	var imports []string
+	lines := strings.Split(schemaContent, "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "import ") {
+			// Extract the import path from: import "path.zed"
+			start := strings.Index(trimmed, "\"")
+			end := strings.LastIndex(trimmed, "\"")
+			if start != -1 && end != -1 && start < end {
+				importPath := trimmed[start+1 : end]
+				imports = append(imports, importPath)
+			}
+		}
+	}
+	return imports
+}
+
+// topologicalSortImports performs a topological sort on the import graph
+func topologicalSortImports(rootFile string, sourceFolder string) ([]string, error) {
+	// Build dependency graph (reverse: track who depends on each file)
+	dependsOn := make(map[string][]string)     // file -> files it imports
+	dependedBy := make(map[string][]string)    // file -> files that import it
+	inDegree := make(map[string]int)
+	allFiles := make(map[string]bool)
+
+	var visitFile func(string) error
+	visitFile = func(filePath string) error {
+		absPath := filepath.Join(sourceFolder, filePath)
+		if allFiles[filePath] {
+			return nil
+		}
+		allFiles[filePath] = true
+
+		content, err := os.ReadFile(absPath)
+		if err != nil {
+			return err
+		}
+
+		imports := parseImports(string(content))
+		dependsOn[filePath] = imports
+		if _, exists := inDegree[filePath]; !exists {
+			inDegree[filePath] = 0
+		}
+
+		for _, imp := range imports {
+			inDegree[filePath]++
+			dependedBy[imp] = append(dependedBy[imp], filePath)
+			if err := visitFile(imp); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Read root file and build graph
+	rootContent, err := os.ReadFile(rootFile)
+	if err != nil {
+		return nil, err
+	}
+
+	rootImports := parseImports(string(rootContent))
+	for _, imp := range rootImports {
+		if err := visitFile(imp); err != nil {
+			return nil, err
+		}
+	}
+
+	// Topological sort using Kahn's algorithm
+	// Files with inDegree 0 have no dependencies, should be first
+	var sorted []string
+	queue := []string{}
+
+	for file := range allFiles {
+		if inDegree[file] == 0 {
+			queue = append(queue, file)
+		}
+	}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		sorted = append(sorted, current)
+
+		// Process files that depend on current
+		for _, dependent := range dependedBy[current] {
+			inDegree[dependent]--
+			if inDegree[dependent] == 0 {
+				queue = append(queue, dependent)
+			}
+		}
+	}
+
+	// Check for cycles
+	if len(sorted) != len(allFiles) {
+		return nil, errors.New("circular dependency detected in imports")
+	}
+
+	return sorted, nil
+}
+
 // Compiles an input schema written in the new composable schema syntax
 // and produces it as a fully-realized schema
 func schemaCompileInner(args []string, writer io.Writer) error {
@@ -435,6 +537,28 @@ func schemaCompileInner(args []string, writer io.Writer) error {
 		return errors.New("attempted to compile empty schema")
 	}
 
+	// Sort imports to resolve dependency order issues
+	sortedImports, err := topologicalSortImports(inputFilepath, inputSourceFolder)
+	if err != nil {
+		log.Debug().Err(err).Msg("could not sort imports, proceeding with original order")
+	} else if len(sortedImports) > 0 {
+		// Rebuild schema with sorted imports
+		var newSchema strings.Builder
+		for _, imp := range sortedImports {
+			newSchema.WriteString(fmt.Sprintf("import \"%s\"\n", imp))
+		}
+		// Add any non-import content from original schema
+		lines := strings.Split(string(schemaBytes), "\n")
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if !strings.HasPrefix(trimmed, "import ") && len(trimmed) > 0 {
+				newSchema.WriteString(line + "\n")
+			}
+		}
+		schemaBytes = []byte(newSchema.String())
+		log.Debug().Strs("sorted_imports", sortedImports).Str("new_schema", newSchema.String()).Msg("reordered imports based on dependencies")
+	}
+
 	compiled, err := newcompiler.Compile(newcompiler.InputSchema{
 		Source:       newinput.Source(inputFilepath),
 		SchemaString: string(schemaBytes),
@@ -442,6 +566,11 @@ func schemaCompileInner(args []string, writer io.Writer) error {
 		newcompiler.SourceFolder(inputSourceFolder))
 	if err != nil {
 		return err
+	}
+
+	// Validate that compilation produced definitions
+	if len(compiled.OrderedDefinitions) == 0 {
+		return errors.New("compilation produced no schema definitions - this may indicate an issue with import resolution or file dependencies")
 	}
 
 	// Attempt to cast one kind of OrderedDefinition to another
